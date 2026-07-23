@@ -35,6 +35,17 @@ def _run(coro):
         loop.close()
 
 
+def _system_prompt_text(value: object) -> str | None:
+    """Resolve ClaudeAgentOptions.system_prompt whether inline or spilled to file."""
+    if value is None:
+        return None
+    if isinstance(value, dict) and value.get("type") == "file":
+        return Path(value["path"]).read_text(encoding="utf-8")
+    if isinstance(value, str):
+        return value
+    raise AssertionError(f"unexpected system_prompt value: {value!r}")
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------
@@ -148,6 +159,111 @@ class TestPromptExtraction(unittest.TestCase):
             prompt,
         )
         self.assertIn("What does this document say?", prompt)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Windows CLI argv limit / system-prompt-file spill
+# ---------------------------------------------------------------------------
+
+
+class TestSystemPromptForCli(unittest.TestCase):
+    """Windows CreateProcess argv limit requires --system-prompt-file spill."""
+
+    def test_oversized_prompt_spills_to_file(self):
+        from omnigent.inner.claude_sdk_executor import (
+            _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS,
+            _system_prompt_for_cli,
+        )
+
+        body = "P" * (_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = _system_prompt_for_cli(body, spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            path = Path(resolved["path"])
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), body)
+
+    def test_short_prompt_stays_inline_off_windows(self):
+        from omnigent.inner import claude_sdk_executor as mod
+
+        with patch.object(mod, "IS_WINDOWS", False):
+            self.assertEqual(mod._system_prompt_for_cli("short prompt"), "short prompt")
+
+    def test_short_prompt_spills_on_windows(self):
+        from omnigent.inner import claude_sdk_executor as mod
+
+        with (
+            patch.object(mod, "IS_WINDOWS", True),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            resolved = mod._system_prompt_for_cli("windows short", spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            self.assertEqual(
+                Path(resolved["path"]).read_text(encoding="utf-8"),
+                "windows short",
+            )
+
+    def test_polly_sized_prompt_uses_file_shape(self):
+        """Regression: Polly's ~15KB prompt must not go on Windows argv."""
+        import yaml
+
+        from omnigent.inner.claude_sdk_executor import _system_prompt_for_cli
+
+        polly_cfg = Path(__file__).resolve().parents[2] / "examples" / "polly" / "config.yaml"
+        if not polly_cfg.is_file():
+            self.skipTest("examples/polly/config.yaml not present")
+        prompt = yaml.safe_load(polly_cfg.read_text(encoding="utf-8")).get("prompt") or ""
+        self.assertGreater(len(prompt), 8000)
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = _system_prompt_for_cli(prompt, spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            self.assertEqual(Path(resolved["path"]).read_text(encoding="utf-8"), prompt)
+
+    def test_executor_caches_spill_per_session(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor()
+        body = "X" * 9000
+        first = executor._resolve_cli_system_prompt("sess-1", body)
+        second = executor._resolve_cli_system_prompt("sess-1", body)
+        self.assertEqual(first, second)
+        executor._forget_cli_system_prompt("sess-1")
+        if isinstance(first, dict):
+            self.assertFalse(Path(first["path"]).exists())
+
+    def test_executor_updates_cached_spill_when_prompt_changes(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor()
+        first = executor._resolve_cli_system_prompt("sess-1", "A" * 9000)
+        second = executor._resolve_cli_system_prompt("sess-1", "B" * 9000)
+        self.assertEqual(first, second)
+        assert isinstance(second, dict)
+        self.assertEqual(Path(second["path"]).read_text(encoding="utf-8"), "B" * 9000)
+        executor._forget_cli_system_prompt("sess-1")
+
+    def test_close_removes_cached_spill_without_live_client(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            resolved = executor._resolve_cli_system_prompt("sess-1", "X" * 9000)
+            assert isinstance(resolved, dict)
+            path = Path(resolved["path"])
+            self.assertTrue(path.exists())
+
+            await executor.close()
+
+            self.assertFalse(path.exists())
+            self.assertEqual(executor._cli_system_prompts, {})
+
+        _run(_t())
 
 
 # ---------------------------------------------------------------------------
@@ -1803,7 +1919,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
-                captured_options["system_prompt"],
+                _system_prompt_text(captured_options["system_prompt"]),
             )
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -1898,7 +2014,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn(
                 "use `mcp__omnigent__sys_session_rename` when instructions say "
                 "`sys_session_rename`",
-                captured_options["system_prompt"],
+                _system_prompt_text(captured_options["system_prompt"]),
             )
             self.assertIsInstance(events[-1], TurnComplete)
 

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -783,6 +783,52 @@ def _build_mcp_tools(
     return mcp_tools
 
 
+# Keep large prompts out of CLI argv; Windows CreateProcess has a
+# particularly small command-line limit.
+_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS = 4000
+
+
+def _system_prompt_for_cli(
+    system_prompt: str | None,
+    *,
+    spill_dir: pathlib.Path | None = None,
+) -> str | dict[str, str] | None:
+    """Return a ClaudeAgentOptions ``system_prompt`` value safe for CLI argv.
+
+    Short prompts stay inline. On Windows, or when the prompt exceeds
+    :data:`_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS`, write the text to a temp
+    file and return ``{"type": "file", "path": ...}`` so the Claude Agent
+    SDK passes ``--system-prompt-file`` instead of embedding the body in
+    the CreateProcess command line.
+
+    :param system_prompt: Assembled system instructions, or ``None``.
+    :param spill_dir: Optional directory for spilled files; defaults to
+        the process temp dir.
+    :returns: The original string, a ``SystemPromptFile`` dict, or ``None``.
+    """
+    if system_prompt is None:
+        return None
+    if not system_prompt:
+        return system_prompt
+    if not IS_WINDOWS and len(system_prompt) <= _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS:
+        return system_prompt
+    directory = spill_dir if spill_dir is not None else pathlib.Path(tempfile.gettempdir())
+    directory.mkdir(parents=True, exist_ok=True)
+    # delete=False: the Claude CLI reads the path after we return; we unlink
+    # when the Omnigent session closes (see ClaudeSDKExecutor.close_session).
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".md",
+        prefix="omnigent-claude-system-prompt-",
+        dir=directory,
+        delete=False,
+    ) as handle:
+        handle.write(system_prompt)
+        path = handle.name
+    return {"type": "file", "path": path}
+
+
 def _augment_system_prompt_for_omnigent_mcp_tools(
     system_prompt: str,
     tool_schemas: list[ToolSpec],
@@ -1415,6 +1461,11 @@ class ClaudeSDKExecutor(Executor):
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
+        # Per-session source text and CLI-safe prompt value.
+        self._cli_system_prompts: dict[
+            str,
+            tuple[str, str | dict[str, str] | None],
+        ] = {}
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1498,6 +1549,56 @@ class ClaudeSDKExecutor(Executor):
         if getattr(self, "_cli_wrapper_path", None):
             with suppress(Exception):
                 pathlib.Path(self._cli_wrapper_path).unlink(missing_ok=True)
+        for _source, value in getattr(self, "_cli_system_prompts", {}).values():
+            if isinstance(value, dict) and value.get("type") == "file":
+                with suppress(Exception):
+                    pathlib.Path(value["path"]).unlink(missing_ok=True)
+
+    def _resolve_cli_system_prompt(
+        self,
+        session_key: str,
+        system_prompt: str,
+    ) -> str | dict[str, str] | None:
+        """Return a CLI-safe system prompt, spilling to a file when needed.
+
+        Caches per *session_key* so multi-turn reconnects reuse one spill
+        file instead of leaking a tempfile every turn.
+
+        :param session_key: Omnigent session id used as the cache key.
+        :param system_prompt: Assembled system instructions for this turn.
+        :returns: Inline string, ``SystemPromptFile`` dict, or ``None``.
+        """
+        cached = self._cli_system_prompts.get(session_key)
+        if cached is not None:
+            cached_source, cached_value = cached
+            if cached_source == system_prompt:
+                return cached_value
+            if isinstance(cached_value, dict) and cached_value.get("type") == "file":
+                should_spill = bool(system_prompt) and (
+                    IS_WINDOWS or len(system_prompt) > _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS
+                )
+                if should_spill:
+                    pathlib.Path(cached_value["path"]).write_text(
+                        system_prompt,
+                        encoding="utf-8",
+                    )
+                    self._cli_system_prompts[session_key] = (
+                        system_prompt,
+                        cached_value,
+                    )
+                    return cached_value
+                pathlib.Path(cached_value["path"]).unlink(missing_ok=True)
+        resolved = _system_prompt_for_cli(system_prompt or None)
+        self._cli_system_prompts[session_key] = (system_prompt, resolved)
+        return resolved
+
+    def _forget_cli_system_prompt(self, session_key: str) -> None:
+        """Drop and unlink any spilled system-prompt file for *session_key*."""
+        cached = self._cli_system_prompts.pop(session_key, None)
+        value = cached[1] if cached is not None else None
+        if isinstance(value, dict) and value.get("type") == "file":
+            with suppress(OSError):
+                pathlib.Path(value["path"]).unlink(missing_ok=True)
 
     async def _route_options_through_gateway_shim(self, options: SdkOptions) -> None:
         """
@@ -1622,6 +1723,7 @@ class ClaudeSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
+        self._forget_cli_system_prompt(session_key)
         await self._close_live_client(session_key)
 
     async def _close_live_client(self, session_key: str) -> None:
@@ -1673,7 +1775,7 @@ class ClaudeSDKExecutor(Executor):
         task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
-        session_keys = list(self._clients)
+        session_keys = set(self._clients) | set(self._cli_system_prompts)
         for session_key in session_keys:
             await self.close_session(session_key)
         if self._gateway_shim is not None:
@@ -2187,7 +2289,7 @@ class ClaudeSDKExecutor(Executor):
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
-            "system_prompt": system_prompt or None,
+            "system_prompt": self._resolve_cli_system_prompt(session_key, system_prompt),
             "mcp_servers": mcp_servers if mcp_servers else {},
             "allowed_tools": allowed_tools,
             "permission_mode": self._permission_mode,
