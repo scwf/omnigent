@@ -25,6 +25,7 @@ from omnigent.runner._entry import (
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
+    _ManagedMintTokenFactory,
     _mint_managed_owner_token,
     _parent_is_orphaned,
     _parent_process_is_alive,
@@ -584,12 +585,14 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
 
     Locks the runner->server contract: POST /v1/runners/{id}/token with
     the tunnel binding token in ``X-Omnigent-Runner-Tunnel-Token``,
-    returning ``{"token", "expires_at"}``.
+    returning ``{"token", "expires_at"}``. Also asserts ``trust_env=False``
+    so a Windows system HTTP proxy cannot swallow loopback mint calls
+    with an empty 502 that never reaches Omnigent.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
-    captured: dict[str, str] = {}
+    captured: dict[str, Any] = {}
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Capture the outgoing mint request and return a canned token."""
@@ -602,6 +605,7 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
 
     def _fake_client(**kwargs: Any) -> httpx.Client:
         """Build a real sync client backed by the capturing MockTransport."""
+        captured["client_kwargs"] = dict(kwargs)
         return real_client(transport=httpx.MockTransport(_handler), **kwargs)
 
     monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
@@ -617,6 +621,95 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert captured["method"] == "POST"
     assert captured["binding_token"] == "the-binding-token"
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
+    assert captured["client_kwargs"].get("trust_env") is False
+
+
+def test_managed_mint_transient_502_sends_bare_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-declining mint failure must not brick callbacks as Databricks.
+
+    Reproduces the Windows + system-proxy failure mode: mint returns HTTP
+    502 (empty body from the proxy) so the factory stays non-declined and
+    empty. Auth must send a bare request instead of raising the old
+    ``Databricks token refresh returned no token`` error that killed every
+    local single-user callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    def _proxy_502(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        del server_url, binding_token
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "Bad Gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _proxy_502)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://localhost:6767/v1/agents/ag_1/download")
+    sent = next(auth.auth_flow(request))
+    assert "Authorization" not in sent.headers
+
+
+def test_runner_auth_raises_clear_error_for_empty_user_credential_factory() -> None:
+    """OIDC/Databricks factories still fail closed with a neutral message.
+
+    :returns: None.
+    """
+    auth = _RunnerDatabricksAuth(lambda: None)
+    request = httpx.Request("GET", "http://server/v1/agents")
+    with pytest.raises(httpx.RequestError, match="server auth token refresh returned no token"):
+        next(auth.auth_flow(request))
+
+
+def test_make_auth_token_factory_declines_delegated_mint_on_local_header_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host ``DELEGATED_AUTH=1`` on a no-mint server ends with factory None.
+
+    Local single-user / header mode returns HTTP 400 from mint. The
+    construction probe must decline so the runner uses bare requests
+    instead of installing a forever-empty managed-mint factory.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        del profile
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    def _refuse_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        del server_url, binding_token
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "unsupported in this auth mode",
+            request=request,
+            response=httpx.Response(400, request=request),
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "local-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint)
+
+    assert _make_auth_token_factory() is None
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

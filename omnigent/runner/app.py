@@ -4116,6 +4116,7 @@ async def _codex_discover_thread_and_forward(
                 headers=headers,
                 auth=_RunnerDatabricksAuth(auth_factory),
                 timeout=httpx.Timeout(10.0),
+                trust_env=False,
             ) as _ext_client:
                 _ext_resp = await _ext_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
@@ -19852,6 +19853,7 @@ def create_runner_app_from_env() -> FastAPI:
     server_client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(5.0, read=None),
+        trust_env=False,
     )
     return create_runner_app(server_client=server_client)
 
