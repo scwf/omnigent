@@ -9,8 +9,10 @@ file runs on both Linux CI and a Windows box.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,6 +21,13 @@ import pytest
 
 from omnigent import _platform
 from omnigent.inner import _proc
+
+
+class _TTYTextIOWrapper(io.TextIOWrapper):
+    """Text stream stand-in that reports an attached terminal."""
+
+    def isatty(self) -> bool:
+        return True
 
 
 def _spin_cmd() -> list[str]:
@@ -38,6 +47,81 @@ def test_platform_flags_are_mutually_consistent() -> None:
     assert (os.name == "posix") == _platform.IS_POSIX
     # Exactly one OS family is true.
     assert _platform.IS_WINDOWS != _platform.IS_POSIX
+
+
+def test_configure_cli_stdio_noop_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX (and forced-off Windows) must not touch streams."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    assert _platform.configure_cli_stdio() is False
+
+
+def test_configure_cli_stdio_reconfigures_gbk_console_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy GBK TextIOWrappers become UTF-8 so emoji / ✓ are printable."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    output_cp_calls: list[None] = []
+    monkeypatch.setattr(
+        _platform,
+        "_set_windows_console_output_utf8",
+        lambda: output_cp_calls.append(None),
+    )
+    out = _TTYTextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    err = _TTYTextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    # Probe: the pre-fix stream rejects the host banner glyph.
+    with pytest.raises(UnicodeEncodeError):
+        out.write("✓")
+    out.seek(0)
+    out.truncate()
+
+    assert _platform.configure_cli_stdio() is True
+    assert out.encoding == "utf-8"
+    assert err.encoding == "utf-8"
+    assert output_cp_calls == [None]
+    # Must not raise — this is the Phase 0 CP936 failure mode.
+    print("✓ Connected 🖥️", file=out, flush=True)
+    out.seek(0)
+    assert "✓" in out.read()
+
+
+def test_configure_cli_stdio_preserves_redirected_stream_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipes stay locale-decodable while replacing unsupported glyphs."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    output_cp_calls: list[None] = []
+    monkeypatch.setattr(
+        _platform,
+        "_set_windows_console_output_utf8",
+        lambda: output_cp_calls.append(None),
+    )
+    buf = io.BytesIO()
+    out = io.TextIOWrapper(buf, encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", out)
+
+    assert _platform.configure_cli_stdio() is True
+    assert out.encoding == "gbk"
+    assert out.errors == "replace"
+    assert output_cp_calls == []
+
+    print("✓ Connected", file=out, flush=True)
+    assert buf.getvalue().decode("gbk").splitlines() == ["? Connected"]
+
+
+def test_safe_console_print_survives_gbk_strict_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A glyph the stream cannot encode must not raise (host-tunnel safety)."""
+    buf = io.BytesIO()
+    gbk = io.TextIOWrapper(buf, encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", gbk)
+    _platform.safe_console_print("✓ Connected as 'host'")
+    gbk.flush()
+    # Replacement bytes were written; no exception escaped.
+    assert buf.getvalue()
 
 
 def test_default_shell_argv_runs_an_echo() -> None:

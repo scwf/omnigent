@@ -28,6 +28,10 @@ def main() -> None:
     :raises SystemExit: If neither / both of ``--server`` and ``--local``
         are provided.
     """
+    from omnigent._platform import configure_cli_stdio
+
+    configure_cli_stdio()
+
     parser = argparse.ArgumentParser(
         description="Background host daemon",
     )
