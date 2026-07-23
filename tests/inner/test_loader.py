@@ -457,6 +457,16 @@ class TestLoadFromDict(unittest.TestCase):
 
 
 class TestLoadFromYAML(unittest.TestCase):
+    def test_load_agent_def_reads_yaml_as_utf8(self):
+        """UTF-8 punctuation must not depend on the Windows locale codec."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "agent.yaml"
+            path.write_bytes(b"name: utf8-agent\nprompt: plans \xe2\x80\x94 and splits\n")
+
+            agent = load_agent_def(path)
+
+        self.assertEqual(agent.prompt, "plans — and splits")
+
     def test_yaml_on_key_is_not_parsed_as_boolean(self):
         yaml_content = """
 name: policy_agent

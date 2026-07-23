@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,6 +68,43 @@ def test_read_skill_file_returns_content(
     )
     assert "# Style Guide" in result
     assert "snake_case" in result
+
+
+def test_read_skill_file_reads_resources_as_utf8(
+    skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skill resources use UTF-8 rather than the Windows locale encoding."""
+    assert skill_with_resources.skill_dir is not None
+    resource = skill_with_resources.skill_dir / "references" / "utf8.md"
+    resource.write_bytes("# 设计说明\n\nUse plans — then execute. ✓".encode())
+
+    original_read_text = Path.read_text
+    observed_encoding: str | None = None
+
+    def _record_encoding(path: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal observed_encoding
+        if path == resource:
+            observed_encoding = kwargs.get("encoding")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _record_encoding)
+    tool = ReadSkillFileTool([skill_with_resources])
+
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "references/utf8.md",
+            }
+        ),
+        tool_ctx,
+    )
+
+    assert observed_encoding == "utf-8"
+    assert "设计说明" in result
+    assert "plans — then execute. ✓" in result
 
 
 def test_read_skill_file_unknown_skill(
