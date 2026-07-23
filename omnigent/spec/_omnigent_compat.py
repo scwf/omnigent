@@ -229,8 +229,8 @@ def is_omnigent_yaml(path: Path) -> bool:
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return False
     try:
-        raw = yaml.safe_load(path.read_text())
-    except yaml.YAMLError:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError):
         return False
     if not isinstance(raw, dict):
         return False
@@ -269,12 +269,14 @@ def diagnose_yaml_rejection(path: Path) -> str:
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return f"file extension is {path.suffix!r}, expected '.yaml' or '.yml'"
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         # Strip trailing whitespace so the message stays one line —
         # PyYAML embeds the source location in its error string,
         # which is exactly what the user needs to fix the typo.
         return f"YAML parse error: {exc!s}".replace("\n", " ").rstrip()
+    except UnicodeDecodeError as exc:
+        return f"file is not valid UTF-8: {exc}"
     if raw is None:
         return "file is empty (or contains only YAML comments / null)"
     if not isinstance(raw, dict):
@@ -377,7 +379,7 @@ def load_omnigent_yaml(
     # read resolves booleans the same way load_agent_def's YAML
     # parsing did — both loaders keep on/off as plain strings
     # instead of the YAML 1.1 bool aliases.
-    raw = _yaml.load(path.read_text(), Loader=_OmnigentYamlLoader) or {}
+    raw = _yaml.load(path.read_text(encoding="utf-8"), Loader=_OmnigentYamlLoader) or {}
     if not isinstance(raw, dict):
         raw = {}
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw)

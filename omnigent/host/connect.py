@@ -178,6 +178,11 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
 
+def _orphan_reaping_supported() -> bool:
+    """Return whether this platform exposes the POSIX child-wait primitives."""
+    return hasattr(os, "waitpid") and hasattr(os, "WNOHANG")
+
+
 def _install_child_subreaper() -> bool:
     """Make this process reap orphaned descendants (Linux only).
 
@@ -796,6 +801,8 @@ class HostProcess:
 
         :returns: Count of orphan (non-runner) processes reaped this sweep.
         """
+        if not _orphan_reaping_supported():
+            return 0
         if self._owned_subprocess_ops > 0:
             # A host-owned subprocess (e.g. a git worktree command) is running
             # in a worker thread. Its child is a DIRECT child of this process
@@ -1912,11 +1919,12 @@ class HostProcess:
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
         # OOM the box on a long-blocked run (#1782).
-        if _install_child_subreaper():
-            _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
-        self._reaper_task = asyncio.create_task(
-            self._orphan_reaper_loop(), name="host-orphan-reaper"
-        )
+        if _orphan_reaping_supported():
+            if _install_child_subreaper():
+                _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
+            self._reaper_task = asyncio.create_task(
+                self._orphan_reaper_loop(), name="host-orphan-reaper"
+            )
         backoff = _RECONNECT_BASE_S
         try:
             while True:

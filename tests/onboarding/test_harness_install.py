@@ -832,6 +832,28 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is expected
 
 
+def test_harness_cli_logged_in_decodes_status_output_as_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status output uses the CLI's UTF-8 pipe encoding, not the system locale."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **kwargs: object):
+        assert argv == ["claude", "auth", "status"]
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        assert "text" not in kwargs
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout='{"loggedIn": true, "message": "signed in — ✓"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+
+
 @pytest.mark.parametrize(
     "stdout,returncode,expected",
     [
