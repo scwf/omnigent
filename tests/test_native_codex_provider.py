@@ -10,11 +10,14 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
+import tomllib
 import yaml
 
+from omnigent._platform import IS_WINDOWS, static_api_key_print_command
 from omnigent.codex_native_app_server import resolve_native_codex_launch
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
 
@@ -77,8 +80,66 @@ def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
     # chat is coerced to responses; codex >= 0.137 rejects a chat config.
     assert 'wire_api="responses"' in joined
     assert 'wire_api="chat"' not in joined
-    # The token command is embedded as the sh auth command.
+    # The token command is embedded in the platform shell auth config.
     assert "printf %s sk-or-test" in joined
+
+
+@pytest.mark.parametrize(
+    ("is_windows", "expected_command", "expected_args_prefix"),
+    [
+        (False, "sh", ["-c"]),
+        (
+            True,
+            "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-Command"],
+        ),
+    ],
+)
+def test_provider_codex_overrides_use_platform_auth_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    is_windows: bool,
+    expected_command: str,
+    expected_args_prefix: list[str],
+) -> None:
+    """The final Codex auth process must exist on the target platform."""
+    monkeypatch.setattr("omnigent.inner.codex_executor.IS_WINDOWS", is_windows)
+    auth_command = static_api_key_print_command("sk-test")
+
+    overrides = _provider_codex_config_overrides(
+        model="gpt-5.5",
+        base_url="https://api.openai.com/v1",
+        auth_command=auth_command,
+        wire_api="responses",
+    )
+
+    parsed = tomllib.loads("\n".join(overrides))
+    auth = parsed["model_providers"]["omnigent_provider"]["auth"]
+    assert auth["command"] == expected_command
+    expected_command_arg = f"& {auth_command}" if is_windows else auth_command
+    assert auth["args"] == [*expected_args_prefix, expected_command_arg]
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="requires Windows PowerShell")
+def test_provider_codex_windows_auth_config_prints_exact_key() -> None:
+    """Execute the final Codex command/args shape, not only the inner helper."""
+    key = "sk-win-test-key-with-$pecial&chars"
+    overrides = _provider_codex_config_overrides(
+        model="gpt-5.5",
+        base_url="https://api.openai.com/v1",
+        auth_command=static_api_key_print_command(key),
+        wire_api="responses",
+    )
+    parsed = tomllib.loads("\n".join(overrides))
+    auth = parsed["model_providers"]["omnigent_provider"]["auth"]
+
+    completed = subprocess.run(
+        [auth["command"], *auth["args"]],
+        check=True,
+        capture_output=True,
+    )
+
+    assert completed.stdout == key.encode("utf-8")
+    assert completed.stderr == b""
 
 
 def test_provider_codex_overrides_preserve_responses_wire() -> None:
@@ -133,7 +194,9 @@ def test_resolve_native_codex_launch_key_default_routes_via_overrides(
     assert launch.model == "gpt-5.5"
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-default" in joined
+    # Auth command is shell/JSON-escaped in the override; the trailing payload
+    # (key on POSIX, base64 on Windows) still appears literally.
+    assert static_api_key_print_command("sk-oai-default").rsplit(None, 1)[-1] in joined
 
 
 def test_resolve_native_codex_launch_openrouter_coerces_chat_wire(_isolated: Path) -> None:
@@ -272,7 +335,7 @@ def test_resolve_native_codex_launch_subscription_no_login_falls_through_to_key(
     assert launch.model == "gpt-5.5"
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-real" in joined
+    assert static_api_key_print_command("sk-oai-real").rsplit(None, 1)[-1] in joined
 
 
 def test_resolve_native_codex_launch_subscription_no_login_no_alternative_uses_login(
@@ -343,7 +406,7 @@ def test_resolve_native_codex_launch_ambient_key_routes(
     assert launch.profile is None
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-ambient" in joined
+    assert static_api_key_print_command("sk-oai-ambient").rsplit(None, 1)[-1] in joined
 
 
 def test_resolve_native_codex_launch_cli_config_default_pins_provider(

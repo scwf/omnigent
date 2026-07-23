@@ -386,3 +386,39 @@ def resolve_repo_symlink(path: Path) -> Path:
     if candidate.exists():
         return candidate.resolve()
     return path
+
+
+def static_api_key_print_command(api_key: str) -> str:
+    """Return a shell command that prints *api_key* with no trailing newline.
+
+    Used as Claude/Codex ``apiKeyHelper`` / gateway auth commands when the
+    credential is a static secret. POSIX hosts use ``printf %s`` (no newline,
+    unlike ``echo``). Native Windows ``cmd.exe`` has no ``printf``, so a bare
+    ``printf`` helper fails and Claude Code silently falls back to
+    ``~/.claude/settings.json`` tokens — which produced false "rate_limit 429"
+    errors against leftover coding-plan quotas. On Windows we therefore emit a
+    ``sys.executable -c …`` command with a base64 payload (shell-safe argv) so
+    both ``cmd.exe`` and Git Bash print the exact key bytes.
+
+    :param api_key: The bearer / API key to print, e.g. ``"sk-..."``.
+    :returns: A shell command string suitable for ``apiKeyHelper``.
+    """
+    import base64
+    import shlex
+
+    if not IS_WINDOWS:
+        return f"printf %s {shlex.quote(api_key)}"
+    payload = base64.b64encode(api_key.encode("utf-8")).decode("ascii")
+    # Forward slashes: accepted by cmd.exe and safe under Git Bash (where
+    # ``D:\code`` would otherwise treat ``\c`` as an escape).
+    # Normalize explicitly instead of relying on Path.as_posix(): Linux CI
+    # exercises this branch with a mocked Windows path, which pathlib treats
+    # as an opaque POSIX filename and therefore leaves backslashes unchanged.
+    exe_path = str(sys.executable).replace("\\", "/")
+    exe = f'"{exe_path}"'
+    # argv[1] is base64 (safe charset); -c string stays ASCII-only.
+    return (
+        f"{exe} -c "
+        f'"import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))" '
+        f"{payload}"
+    )

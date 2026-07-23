@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -25,6 +24,7 @@ if TYPE_CHECKING:
     # import annotations`` is in effect).
     from omnigent.inner.datamodel import OSEnvSpec
 
+from omnigent._platform import static_api_key_print_command
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -465,20 +465,19 @@ def _provider_auth_command(family: FamilyConfig) -> str:
     Mirrors the executors' transport contract: the executors' gateway path
     invokes a shell command that prints the bearer token. A static
     ``api_key`` (already resolved to plaintext by
-    :meth:`ProviderEntry.family`) becomes ``printf %s <shlex-quoted-key>``;
-    a user-supplied dynamic ``auth_command`` passes through verbatim.
+    :meth:`ProviderEntry.family`) becomes a platform-safe print command via
+    :func:`omnigent._platform.static_api_key_print_command`; a user-supplied
+    dynamic ``auth_command`` passes through verbatim.
 
     :param family: The resolved provider family (``base_url`` + secret
         expanded by :meth:`ProviderEntry.family`).
     :returns: A shell command that prints the bearer token to stdout, e.g.
-        ``"printf %s sk-or-abc"`` or the literal ``auth_command``.
+        ``"printf %s sk-or-abc"`` on POSIX, or the literal ``auth_command``.
     :raises OmnigentError: If the family carries neither a static
         ``api_key`` nor an ``auth_command`` (should not happen post-parse).
     """
     if family.api_key is not None:
-        # printf %s avoids the trailing newline ``echo`` would add and is
-        # shell-safe for keys with special characters via shlex.quote.
-        return f"printf %s {shlex.quote(family.api_key)}"
+        return static_api_key_print_command(family.api_key)
     if family.auth_command is not None:
         return family.auth_command
     raise OmnigentError(
@@ -1205,12 +1204,12 @@ def _build_claude_sdk_spawn_env(
         # synthesized-provider path above, so no profile or ucode wiring remains
         # here. The executor strips ANTHROPIC_API_KEY to force subscription auth
         # inside Claude Code, so the key is threaded via the CLI's apiKeyHelper
-        # (a shell command the CLI invokes; shlex.quote keeps it shell-safe).
+        # (a shell command the CLI invokes; platform-safe via static_api_key_print_command).
         auth_from_spec = spec.executor.auth
         if auth_from_spec is None:
             auth_from_spec = _load_global_auth()
         if isinstance(auth_from_spec, ApiKeyAuth) and auth_from_spec.api_key:
-            _key_cmd = f"printf %s {shlex.quote(auth_from_spec.api_key)}"
+            _key_cmd = static_api_key_print_command(auth_from_spec.api_key)
             env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = _key_cmd
             if auth_from_spec.base_url:
                 env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] = auth_from_spec.base_url

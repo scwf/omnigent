@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import subprocess
@@ -47,6 +46,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSo
 from websockets.frames import Close
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import static_api_key_print_command
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import (
@@ -1723,13 +1723,13 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         )
         return None
     # Token delivery mirrors the claude-sdk executor: a dynamic auth_command
-    # is used verbatim; a static key becomes a ``printf`` apiKeyHelper (the
+    # is used verbatim; a static key becomes a platform-safe apiKeyHelper (the
     # runner env allowlist excludes ANTHROPIC_API_KEY, so the key must reach
     # Claude Code via the helper, not the environment).
     if family.auth_command:
         api_key_helper = family.auth_command
     elif family.api_key:
-        api_key_helper = f"printf %s {shlex.quote(family.api_key)}"
+        api_key_helper = static_api_key_print_command(family.api_key)
     else:
         _logger.warning(
             "native-claude: provider %r is the Claude default but has no usable "

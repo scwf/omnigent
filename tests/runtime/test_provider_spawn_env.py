@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 import yaml as _yaml
 
+from omnigent._platform import static_api_key_print_command
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
@@ -211,8 +212,10 @@ def test_claude_sdk_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
     # Host is the origin (scheme://netloc) of the base URL, not the full URL.
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_HOST"] == "https://anthropic.example.com"
-    # The static key becomes a printf command carrying the resolved secret.
-    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    # The static key becomes a platform-safe print command carrying the resolved secret.
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-ant-secret")
+    )
     # No spec model → the family's models.default supplies the model.
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-default-model"
 
@@ -241,7 +244,9 @@ def test_detected_ambient_key_routes_with_no_config(
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://api.anthropic.com"
     # The ambient key is carried as the printf auth command (resolved, not leaked as a ref).
-    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-detected"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-ant-detected")
+    )
     # No pinned model on the detected entry → the catalog default fills in
     # (non-empty), rather than leaving the model unset.
     assert env["HARNESS_CLAUDE_SDK_MODEL"]
@@ -289,7 +294,9 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_GATEWAY"] == "true"
     assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
     assert env["HARNESS_CODEX_GATEWAY_HOST"] == "https://openai.example.com"
-    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-oai-secret")
+    )
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
@@ -337,7 +344,9 @@ def test_codex_falls_back_to_first_available_openai_credential(
     # The fallback credentialed the head — full gateway wiring, same as a default.
     assert env["HARNESS_CODEX_GATEWAY"] == "true"
     assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
-    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-oai-secret")
+    )
     # Resolved per spawn — the user's config is NOT mutated (no default written).
     assert (config_home / "config.yaml").read_text() == before
     # The fallback is spawn-only: the readout-style resolver (flag off, the
@@ -381,7 +390,9 @@ def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
 
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
-    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-ant-secret")
+    )
     assert (config_home / "config.yaml").read_text() == before
     assert _resolve_provider_for_build(spec, harness_type="claude-sdk") is None
 
@@ -471,7 +482,9 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
         '{"claude": "https://anthropic.example.com/v1"}'
     )
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
-    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-ant-secret")
+    )
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
 
 
@@ -512,7 +525,9 @@ def test_named_provider_auth_selects_provider_over_global_default(config_home: P
 
     # The NAMED provider, not the default, supplies the endpoint + key.
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://named.example.com/v1"
-    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-named"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-named")
+    )
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "named-model"
 
 
@@ -655,7 +670,9 @@ def test_claude_sdk_falls_back_to_catalog_default_model(config_home: Path) -> No
     # var that may ever appear is the profile, which is absent here
     # because this is a key provider, not a databricks-kind one.
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
-    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-ant-secret")
+    )
     assert not any(k.startswith("HARNESS_CLAUDE_SDK_DATABRICKS") for k in env)
 
 
@@ -736,7 +753,9 @@ def test_qwen_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_QWEN_GATEWAY"] == "true"
     # The base URL host is the origin of the gateway endpoint
     assert env["HARNESS_QWEN_GATEWAY_HOST"] == "https://openai.example.com"
-    assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == (
+        static_api_key_print_command("sk-oai-secret")
+    )
     # Model comes from provider's default_model
     assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
 
@@ -950,7 +969,7 @@ def test_no_provider_api_key_path_unchanged(config_home: Path) -> None:
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
     # Existing api_key path emits exactly what it did before.
-    assert env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] == "printf %s sk-direct"
+    assert env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] == (static_api_key_print_command("sk-direct"))
     # No provider gateway vars leak in (the provider branch did not fire).
     assert "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL" not in env
     assert "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND" not in env

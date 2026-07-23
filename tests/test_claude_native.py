@@ -22,6 +22,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from omnigent import claude_native
+from omnigent._platform import static_api_key_print_command
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
@@ -6127,7 +6128,7 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
-    assert cfg.api_key_helper == "printf %s sk-ant-test"
+    assert cfg.api_key_helper == static_api_key_print_command("sk-ant-test")
     assert cfg.model == "claude-sonnet-4-6"
 
 
@@ -6278,7 +6279,7 @@ def test_resolve_native_claude_config_spec_provider_default(
     cfg = claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())
     assert cfg is not None
     assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
-    assert cfg.api_key_helper == "printf %s sk-ant-default"
+    assert cfg.api_key_helper == static_api_key_print_command("sk-ant-default")
 
 
 def test_resolve_native_claude_config_subscription_uses_cli_login(
@@ -6369,7 +6370,7 @@ def test_resolve_native_claude_config_ambient_key(
     assert cfg is not None
     assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     # Resolved from the env ref, delivered via the helper (no secret in env).
-    assert cfg.api_key_helper == "printf %s sk-ant-ambient"
+    assert cfg.api_key_helper == static_api_key_print_command("sk-ant-ambient")
 
 
 def test_resolve_native_claude_config_ambient_prefixed_key(
@@ -6386,7 +6387,7 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
-    assert cfg.api_key_helper == "printf %s sk-ant-prefixed"
+    assert cfg.api_key_helper == static_api_key_print_command("sk-ant-prefixed")
 
 
 def test_bedrock_config_auth_command_failure_returns_none() -> None:

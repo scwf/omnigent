@@ -23,6 +23,7 @@ import websockets
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
+from omnigent._platform import static_api_key_print_command
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
@@ -1369,7 +1370,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     if family.auth_command:
         auth_command = family.auth_command
     elif family.api_key:
-        auth_command = f"printf %s {shlex.quote(family.api_key)}"
+        auth_command = static_api_key_print_command(family.api_key)
     else:
         # Serves openai but carries no usable credential.
         return None

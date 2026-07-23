@@ -49,6 +49,49 @@ def test_platform_flags_are_mutually_consistent() -> None:
     assert _platform.IS_WINDOWS != _platform.IS_POSIX
 
 
+def test_static_api_key_print_command_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX emits ``printf %s`` with a shell-quoted key (no trailing newline)."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    assert _platform.static_api_key_print_command("sk-simple") == "printf %s sk-simple"
+    assert _platform.static_api_key_print_command("sk with spaces") == "printf %s 'sk with spaces'"
+
+
+def test_static_api_key_print_command_windows_prints_exact_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows helper must run under cmd.exe and print the key with no newline.
+
+    Regression for bare ``printf`` apiKeyHelper: cmd.exe has no printf, so Claude
+    Code fell back to ~/.claude/settings.json tokens and surfaced false 429s.
+    """
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    key = "sk-win-test-key-with-$pecial&chars"
+    cmd = _platform.static_api_key_print_command(key)
+    assert "printf" not in cmd
+    # Claude's apiKeyHelper is typically invoked via the process shell (cmd on
+    # native Windows). Exercise that path, not just a POSIX sh -c.
+    completed = subprocess.run(
+        cmd,
+        shell=True,
+        check=True,
+        capture_output=True,
+    )
+    assert completed.stdout == key.encode("utf-8")
+    assert completed.stderr == b""
+
+
+def test_static_api_key_print_command_windows_always_quotes_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shell metacharacters in the Python path must remain inert."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.sys, "executable", r"C:\Tools&More\python.exe")
+
+    cmd = _platform.static_api_key_print_command("sk-test")
+
+    assert cmd.startswith('"C:/Tools&More/python.exe" -c ')
+
+
 def test_configure_cli_stdio_noop_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """POSIX (and forced-off Windows) must not touch streams."""
     monkeypatch.setattr(_platform, "IS_WINDOWS", False)
