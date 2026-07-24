@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
@@ -634,6 +634,71 @@ def _unset_env_var(name: str) -> Iterator[None]:
     finally:
         if previous is not None:
             os.environ[name] = previous
+
+
+def _cli_settings_for_api_key_helper(
+    api_key_helper: str,
+    *,
+    base_url: str | None = None,
+    isolate_user_auth: bool = False,
+) -> str:
+    """Build Claude CLI ``--settings`` JSON for an Omnigent apiKeyHelper.
+
+    Every helper is passed through invocation-local settings. When Omnigent
+    manages the gateway, the same higher-precedence payload also blanks user
+    auth and pins the configured base URL so ``~/.claude/settings.json`` cannot
+    redirect the session.
+
+    :param api_key_helper: Shell command that prints the bearer token.
+    :param base_url: Gateway base URL to pin when *isolate_user_auth* is true.
+    :param isolate_user_auth: Isolate the managed gateway from user auth env.
+    :returns: Compact JSON string for ``ClaudeAgentOptions.settings``.
+    :raises ValueError: If managed gateway isolation has no base URL.
+    """
+    settings: dict[str, object] = {"apiKeyHelper": api_key_helper}
+    if isolate_user_auth:
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("Managed Claude gateway auth requires ANTHROPIC_BASE_URL")
+        settings["env"] = {
+            # Empty string = unset for provider selection (Claude Code docs).
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_BASE_URL": base_url,
+        }
+    return json.dumps(settings, separators=(",", ":"))
+
+
+def _pin_cli_settings_base_url(options: SdkOptions, base_url: str) -> None:
+    """Rewrite ``options.settings`` env so ``ANTHROPIC_BASE_URL`` matches *base_url*.
+
+    The gateway shim rewrites ``options.env`` after settings JSON is built;
+    without this pin, a higher-precedence ``--settings`` ``env`` block would
+    keep the upstream URL and bypass the shim. Gateway settings are generated
+    by Omnigent, so an invalid shape is a configuration error rather than a
+    condition to ignore.
+
+    :param options: SDK options whose ``settings`` string may carry ``env``.
+    :param base_url: Final base URL the CLI must use, e.g. the shim loopback.
+    :raises RuntimeError: If managed gateway settings cannot be updated safely.
+    """
+    settings = getattr(options, "settings", None)
+    if not isinstance(settings, str) or not settings:
+        raise RuntimeError("Claude gateway SDK options are missing managed settings")
+    try:
+        body = json.loads(settings)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude gateway SDK settings are not valid JSON") from exc
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("apiKeyHelper"), str)
+        or not body["apiKeyHelper"]
+    ):
+        raise RuntimeError("Claude gateway SDK settings are missing apiKeyHelper")
+    settings_env = body.get("env")
+    if not isinstance(settings_env, dict):
+        raise RuntimeError("Claude gateway SDK settings are missing managed auth env")
+    settings_env["ANTHROPIC_BASE_URL"] = base_url
+    options.settings = json.dumps(body, separators=(",", ":"))
 
 
 _CLOSE_ATTR: str = "close"
@@ -1626,10 +1691,16 @@ class ClaudeSDKExecutor(Executor):
                 "ClaudeSDKExecutor(gateway=True) built SDK options without "
                 "env['ANTHROPIC_BASE_URL']; cannot route through the gateway shim."
             )
+        # Validate managed settings before allocating the loopback listener.
+        # Pinning the current upstream is a no-op for routing and ensures an
+        # invalid payload fails without leaving a started shim behind.
+        _pin_cli_settings_base_url(options, env["ANTHROPIC_BASE_URL"])
         if self._gateway_shim is None:
             self._gateway_shim = ClaudeGatewayShim(upstream_base_url=env["ANTHROPIC_BASE_URL"])
         await self._gateway_shim.start()
         env["ANTHROPIC_BASE_URL"] = self._gateway_shim.base_url
+        # ``--settings`` env outranks process env; keep it on the shim URL.
+        _pin_cli_settings_base_url(options, self._gateway_shim.base_url)
 
     async def _get_or_create_client(
         self,
@@ -1660,13 +1731,15 @@ class ClaudeSDKExecutor(Executor):
                 # error. The SDK merges ``os.environ`` with ``options.env``,
                 # so we unset in ``os.environ`` for the spawn window.
                 #
-                # ANTHROPIC_API_KEY is also stripped so the CLI uses its
-                # subscription auth rather than a developer API key that
-                # would charge separately. Safe even in Databricks mode:
-                # ``options.settings`` explicitly sets apiKeyHelper and
-                # ``options.env`` sets the Databricks base URL, so the
-                # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                # Managed gateways strip ANTHROPIC_API_KEY /
+                # ANTHROPIC_AUTH_TOKEN so parent-shell exports cannot bypass
+                # apiKeyHelper. Non-gateway sessions retain Claude Code's
+                # native auth behavior.
+                with (
+                    _unset_env_var("CLAUDECODE"),
+                    _unset_env_var("ANTHROPIC_API_KEY") if self._gateway else nullcontext(),
+                    _unset_env_var("ANTHROPIC_AUTH_TOKEN") if self._gateway else nullcontext(),
+                ):
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
@@ -2225,8 +2298,15 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Every Omnigent helper is invocation-local. Only a managed gateway
+        # additionally overrides user auth and base URL; ordinary Claude
+        # sessions retain their native ~/.claude/settings.json behavior.
         settings_payload = (
-            json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
+            _cli_settings_for_api_key_helper(
+                api_key_helper,
+                base_url=env.get("ANTHROPIC_BASE_URL"),
+                isolate_user_auth=self._gateway,
+            )
             if api_key_helper
             else None
         )

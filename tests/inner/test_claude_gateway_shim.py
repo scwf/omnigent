@@ -341,7 +341,10 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
     ``_get_or_create_client`` (the seam where ``options.env`` is
     consumed); spawning the real CLI is infeasible in unit tests.
     """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.claude_sdk_executor import (
+        ClaudeSDKExecutor,
+        _cli_settings_for_api_key_helper,
+    )
     from omnigent.inner.databricks_executor import DatabricksCredentials
 
     monkeypatch.setattr(
@@ -376,8 +379,14 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
 
     from types import SimpleNamespace
 
+    upstream_base_url = "https://example.databricks.com/ai-gateway/anthropic"
     options = SimpleNamespace(
-        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        env={"ANTHROPIC_BASE_URL": upstream_base_url},
+        settings=_cli_settings_for_api_key_helper(
+            "databricks auth token --host https://example.databricks.com",
+            base_url=upstream_base_url,
+            isolate_user_auth=True,
+        ),
         stderr=None,
     )
     try:
@@ -393,6 +402,10 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
         assert connect_env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
         assert executor._gateway_shim is not None
         assert connect_env["ANTHROPIC_BASE_URL"] == executor._gateway_shim.base_url
+        settings = json.loads(options.settings)
+        assert settings["env"]["ANTHROPIC_BASE_URL"] == executor._gateway_shim.base_url
+        assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == ""
+        assert settings["env"]["ANTHROPIC_API_KEY"] == ""
     finally:
         if executor._gateway_shim is not None:
             await executor._gateway_shim.aclose()
