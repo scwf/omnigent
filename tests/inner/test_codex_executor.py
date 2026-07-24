@@ -246,10 +246,13 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertNotIn('--profile "test-profile" --force-refresh', auth_override)
 
     def test_constructor_databricks_flag_with_host_override_skips_profile_lookup(self):
+        import tomllib
+
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.codex_executor._databricks_gateway_host") as gateway_host,
+            patch("omnigent.inner.codex_executor.IS_WINDOWS", True),
         ):
             executor = CodexExecutor(
                 gateway=True,
@@ -273,6 +276,13 @@ class TestCodexExecutor(unittest.TestCase):
             any(
                 "databricks auth token --host" in item for item in executor._codex_config_overrides
             )
+        )
+        parsed = tomllib.loads("\n".join(executor._codex_config_overrides))
+        auth = parsed["model_providers"]["omnigent_databricks"]["auth"]
+        self.assertEqual(auth["command"], "powershell.exe")
+        self.assertEqual(
+            auth["args"],
+            ["-NoProfile", "-NonInteractive", "-Command", "& printf token"],
         )
 
     def test_constructor_databricks_flag_with_host_override_requires_base_url(self):

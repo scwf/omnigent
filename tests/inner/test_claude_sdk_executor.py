@@ -35,6 +35,17 @@ def _run(coro):
         loop.close()
 
 
+def _system_prompt_text(value: object) -> str | None:
+    """Resolve ClaudeAgentOptions.system_prompt whether inline or spilled to file."""
+    if value is None:
+        return None
+    if isinstance(value, dict) and value.get("type") == "file":
+        return Path(value["path"]).read_text(encoding="utf-8")
+    if isinstance(value, str):
+        return value
+    raise AssertionError(f"unexpected system_prompt value: {value!r}")
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------
@@ -148,6 +159,111 @@ class TestPromptExtraction(unittest.TestCase):
             prompt,
         )
         self.assertIn("What does this document say?", prompt)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Windows CLI argv limit / system-prompt-file spill
+# ---------------------------------------------------------------------------
+
+
+class TestSystemPromptForCli(unittest.TestCase):
+    """Windows CreateProcess argv limit requires --system-prompt-file spill."""
+
+    def test_oversized_prompt_spills_to_file(self):
+        from omnigent.inner.claude_sdk_executor import (
+            _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS,
+            _system_prompt_for_cli,
+        )
+
+        body = "P" * (_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = _system_prompt_for_cli(body, spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            path = Path(resolved["path"])
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), body)
+
+    def test_short_prompt_stays_inline_off_windows(self):
+        from omnigent.inner import claude_sdk_executor as mod
+
+        with patch.object(mod, "IS_WINDOWS", False):
+            self.assertEqual(mod._system_prompt_for_cli("short prompt"), "short prompt")
+
+    def test_short_prompt_spills_on_windows(self):
+        from omnigent.inner import claude_sdk_executor as mod
+
+        with (
+            patch.object(mod, "IS_WINDOWS", True),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            resolved = mod._system_prompt_for_cli("windows short", spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            self.assertEqual(
+                Path(resolved["path"]).read_text(encoding="utf-8"),
+                "windows short",
+            )
+
+    def test_polly_sized_prompt_uses_file_shape(self):
+        """Regression: Polly's ~15KB prompt must not go on Windows argv."""
+        import yaml
+
+        from omnigent.inner.claude_sdk_executor import _system_prompt_for_cli
+
+        polly_cfg = Path(__file__).resolve().parents[2] / "examples" / "polly" / "config.yaml"
+        if not polly_cfg.is_file():
+            self.skipTest("examples/polly/config.yaml not present")
+        prompt = yaml.safe_load(polly_cfg.read_text(encoding="utf-8")).get("prompt") or ""
+        self.assertGreater(len(prompt), 8000)
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = _system_prompt_for_cli(prompt, spill_dir=Path(tmp))
+            self.assertIsInstance(resolved, dict)
+            assert isinstance(resolved, dict)
+            self.assertEqual(resolved["type"], "file")
+            self.assertEqual(Path(resolved["path"]).read_text(encoding="utf-8"), prompt)
+
+    def test_executor_caches_spill_per_session(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor()
+        body = "X" * 9000
+        first = executor._resolve_cli_system_prompt("sess-1", body)
+        second = executor._resolve_cli_system_prompt("sess-1", body)
+        self.assertEqual(first, second)
+        executor._forget_cli_system_prompt("sess-1")
+        if isinstance(first, dict):
+            self.assertFalse(Path(first["path"]).exists())
+
+    def test_executor_updates_cached_spill_when_prompt_changes(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor()
+        first = executor._resolve_cli_system_prompt("sess-1", "A" * 9000)
+        second = executor._resolve_cli_system_prompt("sess-1", "B" * 9000)
+        self.assertEqual(first, second)
+        assert isinstance(second, dict)
+        self.assertEqual(Path(second["path"]).read_text(encoding="utf-8"), "B" * 9000)
+        executor._forget_cli_system_prompt("sess-1")
+
+    def test_close_removes_cached_spill_without_live_client(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            resolved = executor._resolve_cli_system_prompt("sess-1", "X" * 9000)
+            assert isinstance(resolved, dict)
+            path = Path(resolved["path"])
+            self.assertTrue(path.exists())
+
+            await executor.close()
+
+            self.assertFalse(path.exists())
+            self.assertEqual(executor._cli_system_prompts, {})
+
+        _run(_t())
 
 
 # ---------------------------------------------------------------------------
@@ -1172,6 +1288,14 @@ class TestSystemMessages(unittest.TestCase):
             settings["apiKeyHelper"],
             "databricks auth token --host https://host",
         )
+        # Higher-precedence --settings env blanks user ~/.claude/settings.json
+        # auth so a personal coding-plan token cannot 401 the first request.
+        self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertEqual(settings["env"]["ANTHROPIC_API_KEY"], "")
+        self.assertEqual(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            shim_upstream["base_url"],
+        )
         # The CLI talks to the loopback shim; the shim forwards to the
         # real gateway. A direct gateway URL here would mean the shim was
         # bypassed and opus thinking.display stays stripped.
@@ -1803,7 +1927,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
-                captured_options["system_prompt"],
+                _system_prompt_text(captured_options["system_prompt"]),
             )
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -1898,7 +2022,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn(
                 "use `mcp__omnigent__sys_session_rename` when instructions say "
                 "`sys_session_rename`",
-                captured_options["system_prompt"],
+                _system_prompt_text(captured_options["system_prompt"]),
             )
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -2570,6 +2694,86 @@ class TestStreamEventStreaming(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_cli_settings_for_managed_gateway_blanks_user_auth_env() -> None:
+    """``--settings`` must blank AUTH_TOKEN/API_KEY and pin the gateway URL.
+
+    Regression: user ``~/.claude/settings.json`` often carries a personal
+    coding-plan ``ANTHROPIC_AUTH_TOKEN`` + ``ANTHROPIC_BASE_URL``. Those
+    settings-file env values outrank the process env, so the first request
+    after restart 401s against the wrong credential unless Omnigent's
+    higher-precedence ``--settings`` clears them.
+    """
+    from omnigent.inner.claude_sdk_executor import _cli_settings_for_api_key_helper
+
+    payload = json.loads(
+        _cli_settings_for_api_key_helper(
+            "printf %s sk-test",
+            base_url="https://api.deepseek.com/anthropic",
+            isolate_user_auth=True,
+        )
+    )
+    assert payload["apiKeyHelper"] == "printf %s sk-test"
+    assert payload["env"]["ANTHROPIC_AUTH_TOKEN"] == ""
+    assert payload["env"]["ANTHROPIC_API_KEY"] == ""
+    assert payload["env"]["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+
+def test_cli_settings_for_helper_only_preserves_user_auth_env() -> None:
+    """A non-gateway helper must not override Claude Code's user settings."""
+    from omnigent.inner.claude_sdk_executor import _cli_settings_for_api_key_helper
+
+    payload = json.loads(_cli_settings_for_api_key_helper("printf %s sk-test"))
+
+    assert payload == {"apiKeyHelper": "printf %s sk-test"}
+
+
+def test_cli_settings_for_managed_gateway_requires_base_url() -> None:
+    """Managed auth must fail loud instead of falling back to a user URL."""
+    from omnigent.inner.claude_sdk_executor import _cli_settings_for_api_key_helper
+
+    with pytest.raises(ValueError, match="requires ANTHROPIC_BASE_URL"):
+        _cli_settings_for_api_key_helper(
+            "printf %s sk-test",
+            isolate_user_auth=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        "not-json",
+        "{}",
+        '{"apiKeyHelper":"printf %s sk-test"}',
+    ],
+)
+def test_pin_cli_settings_base_url_rejects_invalid_managed_settings(settings) -> None:
+    """Gateway shim routing must not silently accept an unsafe settings shape."""
+    from omnigent.inner.claude_sdk_executor import _pin_cli_settings_base_url
+
+    options = SimpleNamespace(settings=settings)
+    with pytest.raises(RuntimeError, match="Claude gateway SDK"):
+        _pin_cli_settings_base_url(options, "http://127.0.0.1:12345")
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_invalid_settings_before_starting_shim() -> None:
+    """Invalid managed settings must fail before allocating a loopback shim."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    executor._gateway = True
+    options = SimpleNamespace(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        settings="{}",
+    )
+
+    with pytest.raises(RuntimeError, match="missing apiKeyHelper"):
+        await executor._route_options_through_gateway_shim(options)
+
+    assert executor._gateway_shim is None
+
+
 def test_unset_env_var_removes_and_restores(monkeypatch):
     """Env var present before ``with`` is absent during, restored after."""
     from omnigent.inner.claude_sdk_executor import _unset_env_var
@@ -2639,14 +2843,16 @@ def test_non_databricks_model_without_routing_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
-    """``_get_or_create_client`` must strip ``ANTHROPIC_API_KEY`` from
-    ``os.environ`` during the ``connect()`` window so the Claude CLI
-    uses subscription auth instead of a developer API key.
+async def test_managed_gateway_auth_stripped_during_connect(monkeypatch):
+    """A managed gateway must strip ``ANTHROPIC_API_KEY`` and
+    ``ANTHROPIC_AUTH_TOKEN`` from ``os.environ`` during the ``connect()``
+    window so the Claude CLI uses apiKeyHelper instead of a developer API
+    key or a parent-shell coding-plan token.
 
     This test drives ``_get_or_create_client`` with a stub SDK and
     captures ``os.environ`` at the moment ``connect()`` is invoked,
-    ensuring both ``CLAUDECODE`` and ``ANTHROPIC_API_KEY`` are absent.
+    ensuring ``CLAUDECODE``, ``ANTHROPIC_API_KEY``, and
+    ``ANTHROPIC_AUTH_TOKEN`` are absent.
     """
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -2679,9 +2885,20 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
         ClaudeSDKClient = _StubClient
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "settings-token-secret")
     monkeypatch.setenv("CLAUDECODE", "parent-value")
 
     executor = ClaudeSDKExecutor()
+    executor._gateway = True
+
+    async def _route_through_gateway_shim(options) -> None:
+        """The environment-isolation test does not need a live shim."""
+
+    monkeypatch.setattr(
+        executor,
+        "_route_options_through_gateway_shim",
+        _route_through_gateway_shim,
+    )
     options = SimpleNamespace()
     await executor._get_or_create_client(
         _StubSDK,  # type: ignore[arg-type]
@@ -2690,15 +2907,61 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
         model=None,
     )
 
-    # Both keys must be absent at the moment connect() ran.
+    # Keys must be absent at the moment connect() ran.
     assert "ANTHROPIC_API_KEY" not in connect_env, (
         "ANTHROPIC_API_KEY leaked into connect() -- subscription auth bypassed"
+    )
+    assert "ANTHROPIC_AUTH_TOKEN" not in connect_env, (
+        "ANTHROPIC_AUTH_TOKEN leaked into connect() -- coding-plan token wins"
     )
     assert "CLAUDECODE" not in connect_env, (
         "CLAUDECODE leaked into connect() -- nested-session error risk"
     )
-    # Both are restored after _get_or_create_client returns.
+    # Restored after _get_or_create_client returns.
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-secret"
+    assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "settings-token-secret"
+    assert os.environ["CLAUDECODE"] == "parent-value"
+
+
+@pytest.mark.asyncio
+async def test_non_gateway_auth_preserved_during_connect(monkeypatch):
+    """A normal Claude session must retain its native process authentication."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    connect_env: dict[str, str] = {}
+
+    class _StubClient:
+        def __init__(self, options):
+            self.options = options
+            self._query = None
+            self._transport = None
+
+        async def connect(self) -> None:
+            connect_env.update(os.environ)
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _StubSDK:
+        ClaudeSDKClient = _StubClient
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "native-token-secret")
+    monkeypatch.setenv("CLAUDECODE", "parent-value")
+
+    executor = ClaudeSDKExecutor()
+    await executor._get_or_create_client(
+        _StubSDK,  # type: ignore[arg-type]
+        session_key="native-auth-session",
+        options=SimpleNamespace(),
+        model=None,
+    )
+
+    assert connect_env["ANTHROPIC_API_KEY"] == "sk-ant-test-secret"
+    assert connect_env["ANTHROPIC_AUTH_TOKEN"] == "native-token-secret"
+    assert "CLAUDECODE" not in connect_env
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-secret"
+    assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "native-token-secret"
     assert os.environ["CLAUDECODE"] == "parent-value"
 
 

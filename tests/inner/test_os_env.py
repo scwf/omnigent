@@ -373,6 +373,7 @@ def test_child_shell_env_noop_without_pythonpath(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_only
 def test_shell_command_does_not_see_omnigent_project_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,6 +384,12 @@ def test_shell_command_does_not_see_omnigent_project_root(
     same shape the helper spawn produces — and asserts the agent's command
     sees the sibling project entry but not omnigent's, so project subprocesses
     resolve their own packages.
+
+    POSIX-only: Windows often resolves ``bash`` to WSL's ``bash.exe``, which
+    does not inherit the Windows process ``PYTHONPATH`` the way a native
+    POSIX shell does. The strip logic itself is covered by the
+    ``_child_shell_env`` unit tests above; helper startup on Windows is
+    covered by :func:`test_inactive_sandbox_helper_starts`.
 
     :returns: None.
     """
@@ -401,3 +408,28 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_inactive_sandbox_helper_starts() -> None:
+    """``sandbox.type: none`` must start the OS helper on every platform.
+
+    Regression for Windows: config is delivered via ``--config-file`` in a
+    private tmpdir, but that tmpdir used to be created only when
+    ``sandbox.active``. Inactive policies then hit
+    ``assert self._tmpdir is not None`` before the helper could spawn, so
+    ``sys_os_shell`` / ``sys_os_read`` failed immediately.
+
+    :returns: None.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.shell("echo omnigent-osenv-ok"))
+    finally:
+        os_env.close()
+
+    assert "error" not in result, result
+    assert result.get("exit_code") == 0
+    assert "omnigent-osenv-ok" in (result.get("stdout") or "")

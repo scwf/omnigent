@@ -211,10 +211,12 @@ class _RunnerDatabricksAuth(httpx.Auth):
     ) -> Generator[httpx.Request, httpx.Response, None]:
         """Inject a fresh ``Authorization`` header before each request.
 
-        Fails closed: when the factory is configured but returns no
-        token (transient SDK failure), raises rather than silently
-        sending an unauthenticated request. Retries once with a freshly
-        minted token on either:
+        User-credential factories (OIDC / Databricks SDK) fail closed when
+        they return no token. Managed-mint factories that are declined or
+        temporarily empty send a bare request instead — local single-user
+        servers need no bearer, and auth-required servers answer with
+        401/login redirect so the remint path below can recover. Retries
+        once with a freshly minted token on either:
 
         - HTTP 401 (the standard "your bearer is invalid" response), or
         - a 3xx redirect whose ``Location`` points at the Databricks
@@ -228,9 +230,9 @@ class _RunnerDatabricksAuth(httpx.Auth):
 
         :param request: The outgoing httpx request.
         :yields: The request with the auth header set, or
-            unmodified when no factory is configured.
-        :raises httpx.RequestError: When the factory is configured
-            but returns no token.
+            unmodified when no factory is configured / mint declined.
+        :raises httpx.RequestError: When a user-credential factory is
+            configured but returns no token.
         """
         # Workspace routing: name the workspace or the request routes to the
         # account (the forwarder's POST /events otherwise 403s). Empty when
@@ -241,17 +243,24 @@ class _RunnerDatabricksAuth(httpx.Auth):
             request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
-            if not token:
-                if getattr(self._factory, "declined", False):
-                    # The server definitively refuses to mint for this runner
-                    # (managed mint factory hit HTTP 400/404 after install —
-                    # e.g. its construction probe lost a boot race to a
-                    # no-auth server). Bare requests are correct there; do
-                    # NOT fail closed or the runner bricks every callback.
-                    yield request
-                    return
-                raise httpx.RequestError("Databricks token refresh returned no token")
-            request.headers["Authorization"] = f"Bearer {token}"
+            if token:
+                request.headers["Authorization"] = f"Bearer {token}"
+            elif getattr(self._factory, "declined", False):
+                # Server definitively refuses to mint (HTTP 400/404 / Apps
+                # login redirect). Bare requests are correct for local
+                # single-user / header-mode servers.
+                pass
+            elif isinstance(self._factory, _ManagedMintTokenFactory):
+                # Mint returned nothing without declining (proxy 5xx, boot
+                # race 401, transient blip). Local servers accept bare
+                # requests; auth-required servers answer 401/login redirect
+                # and the remint path below recovers.
+                pass
+            else:
+                # User-credential factories (OIDC / Databricks SDK) must
+                # fail closed — a silent bare request would look like a
+                # mysterious 401 later.
+                raise httpx.RequestError("server auth token refresh returned no token")
         response = yield request
         if self._factory is None:
             return
@@ -676,7 +685,9 @@ def _mint_managed_owner_token(
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url),
     }
-    with httpx.Client(timeout=10.0) as client:
+    # Keep runner-to-server mint requests off system proxies, matching
+    # the local-server health checks.
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -1031,6 +1042,9 @@ def create_app(
         # recorded for this server) routes these callbacks to the workspace.
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
+        # Bypass system proxies so loopback / Apps callbacks hit Omnigent
+        # directly (see ``_mint_managed_owner_token``).
+        trust_env=False,
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
         # Databricks Apps OAuth login redirect (302 →

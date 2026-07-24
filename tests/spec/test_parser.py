@@ -38,6 +38,23 @@ def test_parse_minimal(agent_dir: Path) -> None:
     assert spec.sub_agents == []
 
 
+def test_parse_utf8_em_dash_description(tmp_path: Path) -> None:
+    """Agent YAML with UTF-8 punctuation must load on Windows locale encodings.
+
+    Polly's config uses U+2014 EM DASH (``—``, bytes ``e2 80 94``). On a CP936
+    host, bare ``Path.read_text()`` decodes as GBK and raises UnicodeDecodeError
+    before YAML parsing — the Web UI surfaces that as
+    ``failed to load agent spec: 'gbk' codec can't decode…``.
+    """
+    (tmp_path / "config.yaml").write_bytes(
+        b"spec_version: 1\nname: utf8-agent\ndescription: plans \xe2\x80\x94 and splits\n"
+    )
+    spec = parse(tmp_path)
+    assert spec.name == "utf8-agent"
+    assert spec.description is not None
+    assert "\u2014" in spec.description
+
+
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"config.yaml not found"):
         parse(tmp_path)

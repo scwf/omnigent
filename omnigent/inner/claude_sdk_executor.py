@@ -37,12 +37,12 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -636,6 +636,71 @@ def _unset_env_var(name: str) -> Iterator[None]:
             os.environ[name] = previous
 
 
+def _cli_settings_for_api_key_helper(
+    api_key_helper: str,
+    *,
+    base_url: str | None = None,
+    isolate_user_auth: bool = False,
+) -> str:
+    """Build Claude CLI ``--settings`` JSON for an Omnigent apiKeyHelper.
+
+    Every helper is passed through invocation-local settings. When Omnigent
+    manages the gateway, the same higher-precedence payload also blanks user
+    auth and pins the configured base URL so ``~/.claude/settings.json`` cannot
+    redirect the session.
+
+    :param api_key_helper: Shell command that prints the bearer token.
+    :param base_url: Gateway base URL to pin when *isolate_user_auth* is true.
+    :param isolate_user_auth: Isolate the managed gateway from user auth env.
+    :returns: Compact JSON string for ``ClaudeAgentOptions.settings``.
+    :raises ValueError: If managed gateway isolation has no base URL.
+    """
+    settings: dict[str, object] = {"apiKeyHelper": api_key_helper}
+    if isolate_user_auth:
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("Managed Claude gateway auth requires ANTHROPIC_BASE_URL")
+        settings["env"] = {
+            # Empty string = unset for provider selection (Claude Code docs).
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_BASE_URL": base_url,
+        }
+    return json.dumps(settings, separators=(",", ":"))
+
+
+def _pin_cli_settings_base_url(options: SdkOptions, base_url: str) -> None:
+    """Rewrite ``options.settings`` env so ``ANTHROPIC_BASE_URL`` matches *base_url*.
+
+    The gateway shim rewrites ``options.env`` after settings JSON is built;
+    without this pin, a higher-precedence ``--settings`` ``env`` block would
+    keep the upstream URL and bypass the shim. Gateway settings are generated
+    by Omnigent, so an invalid shape is a configuration error rather than a
+    condition to ignore.
+
+    :param options: SDK options whose ``settings`` string may carry ``env``.
+    :param base_url: Final base URL the CLI must use, e.g. the shim loopback.
+    :raises RuntimeError: If managed gateway settings cannot be updated safely.
+    """
+    settings = getattr(options, "settings", None)
+    if not isinstance(settings, str) or not settings:
+        raise RuntimeError("Claude gateway SDK options are missing managed settings")
+    try:
+        body = json.loads(settings)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude gateway SDK settings are not valid JSON") from exc
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("apiKeyHelper"), str)
+        or not body["apiKeyHelper"]
+    ):
+        raise RuntimeError("Claude gateway SDK settings are missing apiKeyHelper")
+    settings_env = body.get("env")
+    if not isinstance(settings_env, dict):
+        raise RuntimeError("Claude gateway SDK settings are missing managed auth env")
+    settings_env["ANTHROPIC_BASE_URL"] = base_url
+    options.settings = json.dumps(body, separators=(",", ":"))
+
+
 _CLOSE_ATTR: str = "close"
 _TRANSPORT_ATTR: str = "transport"
 _ACLOSE_ATTR: str = "aclose"
@@ -781,6 +846,52 @@ def _build_mcp_tools(
         decorated = sdk.tool(tname, tdesc, tparams)(_make_handler(tname))
         mcp_tools.append(decorated)
     return mcp_tools
+
+
+# Keep large prompts out of CLI argv; Windows CreateProcess has a
+# particularly small command-line limit.
+_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS = 4000
+
+
+def _system_prompt_for_cli(
+    system_prompt: str | None,
+    *,
+    spill_dir: pathlib.Path | None = None,
+) -> str | dict[str, str] | None:
+    """Return a ClaudeAgentOptions ``system_prompt`` value safe for CLI argv.
+
+    Short prompts stay inline. On Windows, or when the prompt exceeds
+    :data:`_CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS`, write the text to a temp
+    file and return ``{"type": "file", "path": ...}`` so the Claude Agent
+    SDK passes ``--system-prompt-file`` instead of embedding the body in
+    the CreateProcess command line.
+
+    :param system_prompt: Assembled system instructions, or ``None``.
+    :param spill_dir: Optional directory for spilled files; defaults to
+        the process temp dir.
+    :returns: The original string, a ``SystemPromptFile`` dict, or ``None``.
+    """
+    if system_prompt is None:
+        return None
+    if not system_prompt:
+        return system_prompt
+    if not IS_WINDOWS and len(system_prompt) <= _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS:
+        return system_prompt
+    directory = spill_dir if spill_dir is not None else pathlib.Path(tempfile.gettempdir())
+    directory.mkdir(parents=True, exist_ok=True)
+    # delete=False: the Claude CLI reads the path after we return; we unlink
+    # when the Omnigent session closes (see ClaudeSDKExecutor.close_session).
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".md",
+        prefix="omnigent-claude-system-prompt-",
+        dir=directory,
+        delete=False,
+    ) as handle:
+        handle.write(system_prompt)
+        path = handle.name
+    return {"type": "file", "path": path}
 
 
 def _augment_system_prompt_for_omnigent_mcp_tools(
@@ -1415,6 +1526,11 @@ class ClaudeSDKExecutor(Executor):
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
+        # Per-session source text and CLI-safe prompt value.
+        self._cli_system_prompts: dict[
+            str,
+            tuple[str, str | dict[str, str] | None],
+        ] = {}
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1498,6 +1614,56 @@ class ClaudeSDKExecutor(Executor):
         if getattr(self, "_cli_wrapper_path", None):
             with suppress(Exception):
                 pathlib.Path(self._cli_wrapper_path).unlink(missing_ok=True)
+        for _source, value in getattr(self, "_cli_system_prompts", {}).values():
+            if isinstance(value, dict) and value.get("type") == "file":
+                with suppress(Exception):
+                    pathlib.Path(value["path"]).unlink(missing_ok=True)
+
+    def _resolve_cli_system_prompt(
+        self,
+        session_key: str,
+        system_prompt: str,
+    ) -> str | dict[str, str] | None:
+        """Return a CLI-safe system prompt, spilling to a file when needed.
+
+        Caches per *session_key* so multi-turn reconnects reuse one spill
+        file instead of leaking a tempfile every turn.
+
+        :param session_key: Omnigent session id used as the cache key.
+        :param system_prompt: Assembled system instructions for this turn.
+        :returns: Inline string, ``SystemPromptFile`` dict, or ``None``.
+        """
+        cached = self._cli_system_prompts.get(session_key)
+        if cached is not None:
+            cached_source, cached_value = cached
+            if cached_source == system_prompt:
+                return cached_value
+            if isinstance(cached_value, dict) and cached_value.get("type") == "file":
+                should_spill = bool(system_prompt) and (
+                    IS_WINDOWS or len(system_prompt) > _CLI_INLINE_SYSTEM_PROMPT_MAX_CHARS
+                )
+                if should_spill:
+                    pathlib.Path(cached_value["path"]).write_text(
+                        system_prompt,
+                        encoding="utf-8",
+                    )
+                    self._cli_system_prompts[session_key] = (
+                        system_prompt,
+                        cached_value,
+                    )
+                    return cached_value
+                pathlib.Path(cached_value["path"]).unlink(missing_ok=True)
+        resolved = _system_prompt_for_cli(system_prompt or None)
+        self._cli_system_prompts[session_key] = (system_prompt, resolved)
+        return resolved
+
+    def _forget_cli_system_prompt(self, session_key: str) -> None:
+        """Drop and unlink any spilled system-prompt file for *session_key*."""
+        cached = self._cli_system_prompts.pop(session_key, None)
+        value = cached[1] if cached is not None else None
+        if isinstance(value, dict) and value.get("type") == "file":
+            with suppress(OSError):
+                pathlib.Path(value["path"]).unlink(missing_ok=True)
 
     async def _route_options_through_gateway_shim(self, options: SdkOptions) -> None:
         """
@@ -1525,10 +1691,16 @@ class ClaudeSDKExecutor(Executor):
                 "ClaudeSDKExecutor(gateway=True) built SDK options without "
                 "env['ANTHROPIC_BASE_URL']; cannot route through the gateway shim."
             )
+        # Validate managed settings before allocating the loopback listener.
+        # Pinning the current upstream is a no-op for routing and ensures an
+        # invalid payload fails without leaving a started shim behind.
+        _pin_cli_settings_base_url(options, env["ANTHROPIC_BASE_URL"])
         if self._gateway_shim is None:
             self._gateway_shim = ClaudeGatewayShim(upstream_base_url=env["ANTHROPIC_BASE_URL"])
         await self._gateway_shim.start()
         env["ANTHROPIC_BASE_URL"] = self._gateway_shim.base_url
+        # ``--settings`` env outranks process env; keep it on the shim URL.
+        _pin_cli_settings_base_url(options, self._gateway_shim.base_url)
 
     async def _get_or_create_client(
         self,
@@ -1559,13 +1731,15 @@ class ClaudeSDKExecutor(Executor):
                 # error. The SDK merges ``os.environ`` with ``options.env``,
                 # so we unset in ``os.environ`` for the spawn window.
                 #
-                # ANTHROPIC_API_KEY is also stripped so the CLI uses its
-                # subscription auth rather than a developer API key that
-                # would charge separately. Safe even in Databricks mode:
-                # ``options.settings`` explicitly sets apiKeyHelper and
-                # ``options.env`` sets the Databricks base URL, so the
-                # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                # Managed gateways strip ANTHROPIC_API_KEY /
+                # ANTHROPIC_AUTH_TOKEN so parent-shell exports cannot bypass
+                # apiKeyHelper. Non-gateway sessions retain Claude Code's
+                # native auth behavior.
+                with (
+                    _unset_env_var("CLAUDECODE"),
+                    _unset_env_var("ANTHROPIC_API_KEY") if self._gateway else nullcontext(),
+                    _unset_env_var("ANTHROPIC_AUTH_TOKEN") if self._gateway else nullcontext(),
+                ):
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
@@ -1622,6 +1796,7 @@ class ClaudeSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
+        self._forget_cli_system_prompt(session_key)
         await self._close_live_client(session_key)
 
     async def _close_live_client(self, session_key: str) -> None:
@@ -1673,7 +1848,7 @@ class ClaudeSDKExecutor(Executor):
         task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
-        session_keys = list(self._clients)
+        session_keys = set(self._clients) | set(self._cli_system_prompts)
         for session_key in session_keys:
             await self.close_session(session_key)
         if self._gateway_shim is not None:
@@ -2123,8 +2298,15 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Every Omnigent helper is invocation-local. Only a managed gateway
+        # additionally overrides user auth and base URL; ordinary Claude
+        # sessions retain their native ~/.claude/settings.json behavior.
         settings_payload = (
-            json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
+            _cli_settings_for_api_key_helper(
+                api_key_helper,
+                base_url=env.get("ANTHROPIC_BASE_URL"),
+                isolate_user_auth=self._gateway,
+            )
             if api_key_helper
             else None
         )
@@ -2187,7 +2369,7 @@ class ClaudeSDKExecutor(Executor):
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
-            "system_prompt": system_prompt or None,
+            "system_prompt": self._resolve_cli_system_prompt(session_key, system_prompt),
             "mcp_servers": mcp_servers if mcp_servers else {},
             "allowed_tools": allowed_tools,
             "permission_mode": self._permission_mode,

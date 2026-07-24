@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -810,6 +810,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    platform_auth_shell: bool = False,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -821,10 +822,15 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param platform_auth_shell: Use the native platform shell for a
+        caller-supplied generic auth command.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    auth_program, auth_args = _codex_auth_process(
+        auth_command,
+        platform_auth_shell=platform_auth_shell,
+    )
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -833,8 +839,8 @@ def _databricks_codex_config_overrides(
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
+            f"auth={{command={json.dumps(auth_program)},"
+            f"args={json.dumps(auth_args)},"
             "timeout_ms=5000,"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
@@ -875,7 +881,12 @@ def _provider_codex_config_overrides(
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_provider"
-    auth_command_json = json.dumps(auth_command)
+    auth_program, auth_args = _codex_auth_process(
+        auth_command,
+        platform_auth_shell=True,
+    )
+    auth_program_json = json.dumps(auth_program)
+    auth_args_json = json.dumps(auth_args)
     # codex >= 0.137 removed the chat/completions wire from its config schema:
     # any provider block carrying wire_api="chat" makes codex hard-fail config
     # load ("wire_api = \"chat\" is no longer supported"), which broke OSS /
@@ -894,14 +905,28 @@ def _provider_codex_config_overrides(
         f"model_providers.{provider_name}="
         '{name="Omnigent Provider",'
         f"base_url={json.dumps(base_url)},"
-        'auth={command="sh",'
-        f'args=["-c",{auth_command_json}],'
+        f"auth={{command={auth_program_json},"
+        f"args={auth_args_json},"
         "timeout_ms=5000,"
         f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
         "},"
         f'wire_api="{effective_wire_api}"}}'
     )
     return overrides
+
+
+def _codex_auth_process(
+    auth_command: str,
+    *,
+    platform_auth_shell: bool,
+) -> tuple[str, list[str]]:
+    """Return the Codex auth executable and argv for *auth_command*."""
+    if platform_auth_shell and IS_WINDOWS:
+        return (
+            "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-Command", f"& {auth_command}"],
+        )
+    return "sh", ["-c", auth_command]
 
 
 def _parse_optional_int(value: str | None) -> int | None:
@@ -2223,6 +2248,7 @@ class CodexExecutor(Executor):
         self._gateway_uses_databricks_profile = False
         if gateway:
             host = self._gateway_host
+            platform_auth_shell = False
             # ``effective_model`` resolves to a concrete model for the codex
             # config. On the Databricks-profile-derivation branch (no gateway
             # host or base URL supplied directly) a ``databricks-*`` default is
@@ -2270,6 +2296,7 @@ class CodexExecutor(Executor):
                     )
                 base_url = base_url_override
                 auth_command = gateway_auth_command
+                platform_auth_shell = True
                 if model is None:
                     # Directly-supplied neutral gateway: the Omnigent producer always
                     # resolves a concrete model (spec > provider default >
@@ -2290,6 +2317,7 @@ class CodexExecutor(Executor):
                     base_url=base_url,
                     auth_command=auth_command,
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
+                    platform_auth_shell=platform_auth_shell,
                 )
             )
         if not enable_web_search:

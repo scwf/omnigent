@@ -701,7 +701,8 @@ def harness_cli_logged_in(key: str) -> bool:
             check=False,
             timeout=30,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
