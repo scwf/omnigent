@@ -2370,6 +2370,54 @@ def test_resolve_bundle_expands_mcp_env(
     assert parsed["env"]["API_TOKEN"] == "stdio-tok-xyz"
 
 
+def test_resolve_bundle_reads_config_and_mcp_as_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bundle preprocessing reads every YAML input explicitly as UTF-8."""
+    monkeypatch.setenv("BUNDLE_UTF8_TOKEN", "resolved-token")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_bytes(
+        (
+            "spec_version: 1\n"
+            "description: plans — and splits\n"
+            "llm:\n"
+            "  connection:\n"
+            "    api_key: ${BUNDLE_UTF8_TOKEN}\n"
+        ).encode()
+    )
+    mcp_path = tmp_path / "tools" / "mcp" / "utf8.yaml"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_bytes(
+        (
+            "name: utf8\n"
+            "transport: http\n"
+            "url: http://localhost:9000/mcp\n"
+            "description: 中文工具\n"
+            "headers:\n"
+            "  Authorization: Bearer ${BUNDLE_UTF8_TOKEN}\n"
+        ).encode()
+    )
+
+    original_read_text = Path.read_text
+    observed: dict[Path, str | None] = {}
+
+    def _record_encoding(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path in {config_path, mcp_path}:
+            observed[path] = kwargs.get("encoding")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _record_encoding)
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+
+    assert observed == {config_path: "utf-8", mcp_path: "utf-8"}
+    config = yaml.safe_load(resolved["config.yaml"])
+    mcp = yaml.safe_load(resolved[str(mcp_path.relative_to(tmp_path))])
+    assert config["description"] == "plans — and splits"
+    assert mcp["description"] == "中文工具"
+
+
 def test_resolve_bundle_no_env_vars_returns_empty(
     tmp_path: Path,
 ) -> None:

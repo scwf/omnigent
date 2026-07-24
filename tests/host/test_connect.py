@@ -14,6 +14,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+import omnigent.host.connect as connect
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
@@ -1127,6 +1128,27 @@ def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
         os.waitpid(pid, 0)
     assert exc_info.value.errno == errno.ECHILD
     # A second sweep with no orphans left is a clean no-op.
+    assert host._reap_orphans_once() == 0
+
+
+async def test_reap_orphans_is_noop_without_posix_wait_primitives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows has no waitpid/WNOHANG, so its host must skip orphan reaping."""
+    host = _make_host_process()
+    monkeypatch.delattr(connect.os, "waitpid", raising=False)
+    monkeypatch.delattr(connect.os, "WNOHANG", raising=False)
+    monkeypatch.setattr(
+        host,
+        "_reap_orphans_waitid",
+        lambda: (_ for _ in ()).throw(AssertionError("waitid reaper called")),
+    )
+    monkeypatch.setattr(
+        host,
+        "_reap_orphans_waitpid",
+        lambda: (_ for _ in ()).throw(AssertionError("waitpid reaper called")),
+    )
+
     assert host._reap_orphans_once() == 0
 
 
