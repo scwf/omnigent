@@ -441,6 +441,11 @@ class _HelperProcessClient:
                     parent_env=credential_parent_env,
                 )
                 env.update(credential_runtime.helper_env_updates)
+        elif IS_WINDOWS:
+            # Windows delivers helper config via ``--config-file`` (no
+            # ``pass_fds``). Inactive sandboxes still need a private scratch
+            # dir for that ephemeral file; POSIX uses a pipe and skips this.
+            self._tmpdir = create_private_tmpdir()
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
@@ -490,9 +495,12 @@ class _HelperProcessClient:
         # ``pass_fds`` / fd inheritance in ``subprocess`` (CPython rejects
         # ``pass_fds`` outright there), so fall back to a short-lived file in the
         # helper's own private tmpdir, which the helper reads and unlinks
-        # immediately. Egress is POSIX-only (its proxy binds a Unix socket), so
-        # the Windows config carries no secret — only non-sensitive
-        # paths/booleans — but we still keep the file private and ephemeral.
+        # immediately. That tmpdir is created above for every Windows helper —
+        # including inactive ``sandbox.type: none`` — because the config-file
+        # path is mandatory on Windows regardless of sandbox activity. Egress
+        # is POSIX-only (its proxy binds a Unix socket), so the Windows config
+        # carries no secret — only non-sensitive paths/booleans — but we still
+        # keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
             assert self._tmpdir is not None
